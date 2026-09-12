@@ -1,0 +1,647 @@
+---
+title: "Project 2 – EDA, Cleaning & Predictive Modelling"
+author: "Warner Alexis · Dirk Hartog · Amish Rasheed · Woodelyne Durosier · Akeem Lawrence · Fares Alahdab "
+output:
+  html_document: default
+  pdf_document: default
+---
+------------------------------------------------------------------------
+
+## 1· Setup & Libraries
+
+```{r setup, message = FALSE, warning = FALSE}
+library(readxl)        
+library(readr)         
+library(dplyr)
+library(stringr)
+library(tidyr)        
+library(purrr)        
+library(writexl)       
+library(ggplot2)
+library(ggridges)
+library(DataExplorer)
+library(skimr)
+library(caret)         
+library(VIM) 
+library(gridExtra)
+library(smotefamily)   
+library(fastDummies)
+library(rsample)
+library(earth)
+library(googlesheets4)
+
+theme_set(theme_minimal())
+```
+
+------------------------------------------------------------------------
+
+## 2· Load Raw Data
+
+```{r load-data}
+train_raw <- read_sheet("https://docs.google.com/spreadsheets/d/1jGyM_rXfzo7fq9gDaBTZGVPKW12Lfun7GMST6ITnBLs")
+eval_raw  <- read_sheet("https://docs.google.com/spreadsheets/d/17qyyAB4V7gIN0H8mCPSYAsNXyW-GLj8JRG33M896Rhc")
+
+names(train_raw) <- str_replace_all(names(train_raw), " ", "_")
+names(eval_raw)  <- str_replace_all(names(eval_raw),  " ", "_")
+```
+
+------------------------------------------------------------------------
+
+## 3· Exploratory Data Analysis (EDA)
+
+**overview**
+The dataset titled studentdata contains 2,571 observations and 33 variables, capturing detailed measurements from ABC Beverage's manufacturing process. These variables encompass both process metrics—such as pressure, flow, temperature—and chemical indicators, including alcohol content, density, and carbonation, with the primary modeling target being pH. The Brand Code column, a categorical identifier originally representing values A, B, C, and D, has been encoded numerically (1–4) but includes 120 missing entries. Core production variables like Carb Volume (5.04–5.70) and Fill Ounces (23.63–24.32) show tight operational ranges, whereas others like PC Volume and PSC exhibit wider variability and higher missingness (up to 39 missing values).
+
+More complex or sensor-derived features—such as Hyd Pressure1–4, Balling, Oxygen Filler, and Carb Rel—also show notable gaps and fluctuations, suggesting areas for equipment calibration or process standardization. A structural diagnostic reveals that 96.97% of the columns are continuous, with just 3.03% discrete, making the data set well-suited for numerical modeling. Importantly, 79.27% of rows are complete, and only 0.99% of total data points are missing, indicating minimal and scattered missingness. With a footprint of just 670.4 Kb, the data set is lightweight and efficient to work with in R or Python. In summary, the data is mostly clean, structurally sound, and ready for predictive modeling with only minor imputation required.
+
+```{r}
+#take a look at the column and data types
+# Advanced data descriptions
+
+skim(train_raw)
+summary(train_raw)
+
+# give an idea of what the data set is
+plot_intro(train_raw)
+```
+
+**missing data**
+```{r}
+# plot missing data
+plot_missing(train_raw)
+# Advanced data descriptions
+skim(train_raw)
+```
+
+**variables**
+```{r}
+# Observations with the target variables
+colnames(train_raw)
+
+# Only categorical values  column 
+ggplot(train_raw, aes(x = Brand_Code, fill = Brand_Code)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = after_stat(count)),
+            vjust = 1.4, colour = "white") +
+  labs(title = "Brand_Code frequency", x = NULL, y = "Count") +
+  theme(legend.position = "none")
+```
+
+Brand B is the most frequently produced product in this data set with 1239 counts. This imbalance suggests that Brand B dominates production, which could influence the predictive model for pH due to its high representation. It’s important to verify whether pH behavior differs by brand and, if so, account for it in modeling or stratify analysis accordingly.
+
+```{r}
+# plot average PH by brand code
+train_raw %>% group_by(Brand_Code) %>% 
+  summarise(Mean_PH = mean(PH, na.rm = T)) %>% 
+              ggplot(aes(x = Brand_Code, y = Mean_PH, fill = Brand_Code)) + geom_col() + 
+              geom_text(aes(label = round(Mean_PH, 3)), vjust = 1.5, colour = "white") +
+  labs(title = "Average pH by Brand Code", y = "Mean pH")
+```
+
+We can see that there is a difference in the average pH values in each brand code. This further provides evidence that attaining a more balanced representation of brand code will be important in reducing bias. 
+
+```{r}
+# create a correlation graph and p-value
+categorical_cols <- sapply(train_raw, is.character) | sapply(data, is.factor)
+train_raw[categorical_cols] <- lapply(train_raw[categorical_cols], function(x) as.numeric(as.factor(x)))
+target <- "PH"
+
+# Initializing an empty data frame
+results <- data.frame(Feature = character(), Correlation = numeric(), P_value = numeric(), stringsAsFactors = FALSE)
+
+for (col in names(train_raw)) {
+  if (col != target) {
+    correlation <- cor(train_raw[[col]], train_raw[[target]], use = "complete.obs", method = 'pearson')
+    p_value <- cor.test(train_raw[[col]], train_raw[[target]], method = 'pearson')$p.value
+    
+    results <- rbind(results, data.frame(Feature = col, Correlation = correlation, P_value = p_value))
+  }
+}
+
+print(results)
+```
+
+Correlation between PH and other variables reveals that Bowl Setpoint, Filler Level, and Pressure Vacuum have the strongest positive associations with pH, while Mnf Flow, Pressure Setpoint, and Usage Cont show strong negative correlations with all statistically significant with very low p-values. PH influenced key operations. Variables like Carb Temp, Filler Speed, and Air Pressurer show weak or non-significant relationships, suggesting minimal influence on pH.
+
+```{r}
+# Drop non-numeric columns and rows with missing PH
+data_clean <- train_raw %>%
+  select_if(is.numeric) %>%
+  drop_na(PH)
+
+
+# Compute correlation with PH
+correlations <- data_clean %>%
+  select(-PH) %>%
+  summarise_all(~cor(.x, data_clean$PH, use = "complete.obs")) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Correlation") %>%
+  arrange(desc(abs(Correlation))) 
+# Barplot of correlations
+ggplot(correlations, aes(x = reorder(Variable, Correlation), y = Correlation)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Correlation of Variables with PH",
+       x = "Variable",
+       y = "Correlation Coefficient") +
+  theme_minimal()
+```
+
+The bar plot visualizes the strength and direction of correlation between various manufacturing variables and pH levels in the production process. At a high level, it shows that Bowl Setpoint, Filler Level, and Pressure Vacuum have the strongest positive correlations with pH, suggesting that higher values in these variables are typically associated with higher pH. Conversely, variables like MnF Flow, Pressure Setpoint, and various Hydraulic Pressures show the most negative correlations, indicating that increases in these may lead to lower pH values. Most other variables exhibit weak or negligible correlations, implying limited direct influence on pH individually. This insight helps prioritize which process parameters should be monitored or adjusted when targeting pH control.
+
+
+**Relationships, Distributions and Checking Outliers**
+
+```{r warning = FALSE}
+# Keep only numeric columns and drop rows with missing PH
+data_numeric <- train_raw %>%
+  select(where(is.numeric)) %>%
+  drop_na(PH)
+# Get all column names except PH
+predictors <- setdiff(names(data_numeric), "PH")
+# Create scatter plots for all numeric variables against PH (excluding PH itself)
+# Generate scatter plots where color is mapped to PH
+plots <- map(predictors, function(var) {
+  ggplot(data_numeric, aes(x = .data[[var]], y = PH, color = PH)) +
+    geom_point(alpha = 0.6) +
+    geom_smooth(method = "lm", se = FALSE, color = "black", linetype = "dashed") +
+    scale_color_gradient(low = "blue", high = "red") +
+    labs(title = paste("PH vs", var), x = var, y = "PH") +
+    theme_minimal()
+})
+# Display first 6 plots
+grid.arrange(grobs = plots[1:6], ncol = 3)
+```
+
+
+```{r Histograms}
+# plot histogram for only continuous data
+plot_histogram(train_raw)
+```
+Some features, like Carb Pressure, Fill Ounces, and PC Volume, display near-normal distributions, indicating stable process control. Others, such as Oxygen Filler, PSC CO2, Carb Flow, and Usage Cont, are heavily right-skewed, with long tails suggesting sporadic high values or potential outliers.
+
+
+```{r Box plots}
+
+# Select only numeric columns
+numeric_data <- train_raw %>% select(where(is.numeric))
+
+# Convert data to long format for ggplot
+long_data <- numeric_data %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value")
+
+# Generate boxplots with facets
+ggplot(long_data, aes(x = "", y = Value)) +
+  geom_boxplot(fill = "skyblue", outlier.alpha = 0.3) +
+  facet_wrap(~ Variable, scales = "free_y") +
+  labs(title = "Boxplots of All Numeric Variables", x = NULL, y = "Value") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        strip.text = element_text(size = 8))
+```
+
+The boxplot grid highlights the distribution and outliers across all numeric variables. Several features, such as MFR, Hydraulic Pressures, Filler Speed, Oxygen Filler, and PSC CO2, display a high number of outliers, indicating measurement variability or extreme values. In contrast, variables like pH, Carb Volume, and Fill Ounces are tightly clustered with minimal deviation, suggesting strong process control.
+
+## Evaluate correlations among predictors and PH
+
+Using findCorrelation function finds the absolute pairwise correlations between variables at the level set by the cutoff value. It looks at the average correlations between each predictor and identifies those with the largest mean absolute correlation. We don't have to eliminate these predictors but it gives an idea of which ones might be the most influential. 
+
+```{r Correlations, fig.dim=c(10, 10)}
+# Find correlation coefficients *before missing values
+cor_coef <- cor(train_raw %>% select(-Brand_Code), use = "complete.obs") #%>% drop_na())
+
+## Create a corplot to visualize the correlations 
+## order the correlations into clusters or regions of high correlations 
+corrplot::corrplot(cor_coef, order = "hclust")
+
+# Find high correlations 
+
+## Returns column numbers denoting the predictors that are recommended for 
+## deletion using the findCorrelation() function in the caret package
+highCorr <- findCorrelation(cor_coef, cutoff = .80, exact = TRUE)
+
+## Get names of the columns
+colnames(train_raw[, highCorr])
+```
+
+------------------------------------------------------------------------
+
+## 4·Outlier Diagnostics & Handling
+
+### 4.1 Understand Skewness / Kurtosis
+
+Another way of understanding the distribution of the data is to calculate the skewness and kurtosis. Skewness measures the asymmetry of a distribution, while kurtosis captures how heavy the tails are (i.e how many extreme values reside in the tails) relative to a normal curve. Highly skewed variables are more likely to harbor extreme values that can distort model training.
+
+```{r outlier-diagnostics}
+library(e1071)  # for skewness / kurtosis
+
+num_only <- select(train_raw, where(is.numeric))
+
+# compute skew / kurtosis excluding Brand_Code and PH
+sk_kurt <- tibble(
+  Feature   = setdiff(names(num_only), c("PH")),
+  Skewness  = apply(select(num_only, -PH), 2, skewness,  na.rm = TRUE),
+  Kurtosis  = apply(select(num_only, -PH), 2, kurtosis, na.rm = TRUE)
+) %>% arrange(desc(Skewness))
+
+head(sk_kurt, 5)  # top positively skewed
+tail(sk_kurt, 5)  # most negatively skewed
+```
+
+We see **Oxygen_Filler**, **Temperature**, and **Air_Pressurer** have the largest positive skew; **Filler_Speed** and **MFR** are the most negatively skewed.
+
+### 4.2 Count Potential Outliers
+
+An observation beyond $q1 - 1.5*IQR$ or $q3 + 1.5*IQR$ is flagged as an extreme value.
+
+```{r outlier-counts}
+count_outliers <- function(x) {
+  x <- na.omit(x)
+  iqr <- IQR(x)
+  q1  <- quantile(x, .25)
+  q3  <- quantile(x, .75)
+  sum(x < q1 - 1.5*iqr | x > q3 + 1.5*iqr)
+}
+
+outlier_tbl <- map_dfr(select(num_only, -PH), count_outliers, .id = "Feature") %>%
+  rename(Outlier_Count = 1) %>% arrange(desc(Outlier_Count))
+
+head(outlier_tbl, 10)
+```
+
+The same trio (**MFR**, **Filler_Speed**, **Oxygen_Filler**) tops the outlier‑count list, validating our earlier focus.
+
+### 4.3 Histograms of High‑Outlier Variables (optional)
+```{r outlier-hists, fig.height=4, fig.width=6, echo=FALSE}
+par(mfrow = c(2,3))
+for (v in c("Filler_Speed", "MFR", "Air_Pressurer", "Oxygen_Filler", "Pressure_Vacuum", "Temperature")) {
+  hist(train_raw[[v]], main = v, col = "steelblue", xlab = "", breaks = 30)
+}
+par(mfrow = c(1,1))
+```
+
+### 4.4 IQR Trimming (convert extremes to NA)
+
+Rather than deleting rows, we convert extreme tails (>1.5×IQR) in **MFR**, **Filler_Speed**, and **Oxygen_Filler** to `NA`. The focuse was on handling outliers only in these three features as they had the most extreme outliers. The recoded `NA` values will be imputed in the next step.
+
+```{r outlier-trim}
+trim_cols <- c("MFR", "Filler_Speed", "Oxygen_Filler")
+
+for (col in trim_cols) {
+  iqr <- IQR(train_raw[[col]], na.rm = TRUE)
+  bounds <- quantile(train_raw[[col]], c(.25, .75), na.rm = TRUE) + c(-1, 1) * 1.5 * iqr
+  train_raw[[col]] <- ifelse(between(train_raw[[col]], bounds[1], bounds[2]),
+                             train_raw[[col]], NA_real_)
+}
+
+studentData_outliers_rm <- train_raw  # keep legacy name for downstream code
+```
+
+------------------------------------------------------------------------
+
+## 5· kNN Imputation (with & without outliers)
+
+```{r knn-impute}
+# 5a· kNN on outlier‑removed frame ---------------------------
+set.seed(100)
+students_cleaned <- studentData_outliers_rm %>%
+  kNN(k = 5) %>%
+  select(1:33)    # drop VIM appended columns
+
+# 5b· kNN on original raw frame ------------------------------
+set.seed(101)
+students_naFilled <- train_raw %>%
+  kNN(k = 5) %>%
+  select(1:33)
+```
+
+------------------------------------------------------------------------
+
+## 6· Balance Categorical Variable via SMOTE
+
+```{r smote-balance}
+set.seed(102)
+smote_res   <- SMOTE(students_naFilled[,-1], target = students_naFilled$Brand_Code,
+                     K = 5, dup_size = 2)
+students_balanced <- smote_res$data %>%
+  rename(Brand_Code = class)
+```
+
+```{r brand-after-smote}
+ggplot(students_balanced, aes(Brand_Code, fill = Brand_Code)) +
+  geom_bar() +
+  labs(title = "Balanced Brand_Code after SMOTE", y = "Count", x = NULL) +
+  geom_text(stat = "count", aes(label = after_stat(count)),
+            vjust = 1.4, colour = "white")
+  theme(legend.position = "none")
+```
+
+Using SMOTE partially re balanced the data, adding more observations with Brand_Code A (recoded as 1) and Brand_Code C (recoded as 3). 
+
+------------------------------------------------------------------------
+
+## 7· Dummy‑Encoding & Final Modelling Frame
+
+```{r dummy-encode}
+students_balanced <- dummy_cols(students_balanced, select_columns = "Brand_Code") %>%
+  select(-Brand_Code)
+```
+
+------------------------------------------------------------------------
+
+## 8· Train/Test Split
+
+```{r split}
+set.seed(200)
+train_test_split <- initial_split(students_balanced, prop = 0.7)
+train_df <- training(train_test_split) %>% drop_na()
+test_df  <- testing(train_test_split)  %>% drop_na()
+
+x_train <- select(train_df, -PH)
+y_train <- train_df$PH
+x_test  <- select(test_df,  -PH)
+y_test  <- test_df$PH
+
+ctrl <- trainControl(method = "cv", number = 10, allowParallel = TRUE)
+```
+
+------------------------------------------------------------------------
+
+## 9· Model Training
+
+The exploratory data analysis revealed several factors that assisted in choosing models to test the predictability of pH. The existence of weak correlations and the presence of heavy outliers dissuaded the use of linear models as these would not capture the true relationship between the predictors and pH. With a goal of understanding which predictors had the most influence over pH, a strategy that narrowed down the predictors through feature selection was also an important consideration.  An initial round of base models were fitted to evaluate and confirm which models were better suited for the data and our goal. 
+
+
+```{r Base models}
+  
+  run_models <- function(data, target = "ph") {
+    library(caret)
+    library(randomForest)
+    library(xgboost)
+    library(e1071)
+    library(dplyr)
+    
+    set.seed(123)
+    
+    # Step 1: Impute missing values and scale data
+    preproc <- preProcess(data, method = c("medianImpute", "center", "scale"))
+    data_clean <- predict(preproc, newdata = data)
+    
+    # Step 2: Train/test split
+    train_index <- createDataPartition(data_clean[[target]], p = 0.8, list = FALSE)
+    train_data <- data_clean[train_index, ]
+    test_data <- data_clean[-train_index, ]
+    
+    # Extract x and y for models that need matrix input
+    x_train <- train_data %>% select(-all_of(target)) %>% as.matrix()
+    y_train <- train_data[[target]]
+    x_test <- test_data %>% select(-all_of(target)) %>% as.matrix()
+    y_test <- test_data[[target]]
+    
+    results <- list()
+    
+    ## 1. Linear Regression
+    lm_model <- lm(as.formula(paste(target, "~ .")), data = train_data)
+    lm_preds <- predict(lm_model, newdata = test_data)
+    results$Linear_Regression <- postResample(lm_preds, y_test)
+    
+    ## 2. Random Forest
+    rf_model <- randomForest(as.formula(paste(target, "~ .")), data = train_data)
+    rf_preds <- predict(rf_model, newdata = test_data)
+    results$Random_Forest <- postResample(rf_preds, y_test)
+    
+    ## 3. XGBoost
+    dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+    dtest <- xgb.DMatrix(data = x_test, label = y_test)
+    xgb_model <- xgboost(data = dtrain, nrounds = 100, objective = "reg:squarederror", verbose = 0)
+    xgb_preds <- predict(xgb_model, newdata = dtest)
+    results$XGBoost <- postResample(xgb_preds, y_test)
+    
+    ## 4. SVR
+    svr_model <- svm(x = x_train, y = y_train, type = "eps-regression", kernel = "radial")
+    svr_preds <- predict(svr_model, x_test)
+    results$SVR <- postResample(svr_preds, y_test)
+    
+    ## Print all results
+    for (model in names(results)) {
+      cat("Model:", model, "\n")
+      print(results[[model]])
+      cat("\n")
+    }
+    
+    return(invisible(results))
+  }
+  
+  cleaned_data <- janitor::clean_names(students_balanced)
+  model_results <- run_models(cleaned_data)
+  
+ 
+  # Convert results to a tidy data frame
+  performance_df <- bind_rows(model_results, .id = "Model") %>%
+    pivot_longer(cols = -Model, names_to = "Metric", values_to = "Value")
+  
+  # Plot
+  ggplot(performance_df, aes(x = Model, y = Value, fill = Metric)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(title = "Model Comparison: RMSE, R², MAE",
+         y = "Metric Value",
+         x = "Model") +
+    theme_minimal() +
+    scale_fill_brewer(palette = "Set2")
+```
+
+As expected the linear model had the poorest performance based on the lowest Rsquared and the highest RMSE. Non linear models were selected to move forward with the aim of improve accuracy using cross validation and hyper-parameter tuning. The final set of models tested were MARS, SVM, Random Forest, XGBoost and Cubist. The model with the highest R_squared value was used to predict pH for the new data - eval_raw. 
+
+### 9a. MARS (Multivariate Adaptive Regression Splines)
+A flexible spline‑based regression that automatically selects knots and
+interactions.
+
+```{r mars}
+set.seed(201)
+mars_grid <- expand.grid(degree = 1:4, nprune = seq(5,50,5))
+
+mars_fit <- train(x_train, y_train,
+                  method = "earth",
+                  tuneGrid = mars_grid,
+                  trControl = ctrl,
+                  metric = "Rsquared",
+                  preProcess = c("center","scale"))
+```
+
+### 9b. Support Vector Machine (RBF kernel)
+Captures non‑linear relationships by projecting data into a high‑dimensional
+feature space.
+
+```{r svm}
+set.seed(202)
+svm_fit <- train(x_train, y_train,
+                 method = "svmRadial",
+                 tuneLength = 14,
+                 trControl = ctrl,
+                 metric = "Rsquared",
+                 preProcess = c("center","scale"))
+```
+
+### 9c. Random Forest
+```{r rf}
+set.seed(203)
+rf_grid <- expand.grid(mtry = c(12,14,16)) # Number of predictors to sample at each run
+
+rf_fit <- train(x_train, y_train,
+                method = "rf",
+                tuneLength = 10,
+                tuneGrid = rf_grid,
+                trControl = ctrl,
+                metric = "Rsquared")
+```
+
+### 9d. XG Boost (XGB)
+```{r xgb, message = FALSE}
+
+xgb_grid <- expand.grid(
+  nrounds = seq(from = 200, to = 500, by = 50),
+  eta = c(0.1, 0.3),
+  max_depth = c(6, 8),
+  gamma = c(0, 0.5,1),
+  colsample_bytree = c(0.6, 0.8, 1),
+  min_child_weight = 1,
+  subsample = 1
+)
+
+xgb_fit <- train(x = x_train,
+                 y = y_train,
+                 method = "xgbTree",
+                 # Use R-sqaured to find best model
+                 metric = "Rsquared",
+                 # Use 10 fold cross validation and Grid search
+                 trControl = ctrl,
+                 tuneGrid = xgb_grid,
+                 verbose = FALSE,
+                 verbosity = 0
+                 )
+```
+
+
+### 9e · Cubist (Rule‑Based Regression)
+```{r cubist}
+set.seed(205)
+cub_grid <- expand.grid(committees = c(1,10,50,100), neighbors = c(0,1,5,9))
+
+cubist_fit <- train(x_train, y_train,
+                    method = "cubist",
+                    tuneGrid = cub_grid,
+                    trControl = ctrl,
+                    metric = "Rsquared",
+                    preProcess = c("center","scale"))
+```
+
+
+------------------------------------------------------------------------
+
+## 10· Performance on Held‑out Test Set
+
+```{r metrics}
+get_metrics <- function(fit, x, y) {
+  p <- as.numeric(predict(fit, x))
+  tibble(RMSE = RMSE(p, y),
+         Rsq  = R2(p, y),
+         MAE  = MAE(p, y))
+}
+
+metrics_tbl <- bind_rows(
+  get_metrics(mars_fit,  x_test, y_test),
+  get_metrics(svm_fit,   x_test, y_test),
+  get_metrics(rf_fit,    x_test, y_test),
+  get_metrics(xgb_fit,   x_test, y_test),
+  get_metrics(cubist_fit,x_test, y_test)
+) %>%
+  mutate(Model = c("MARS","SVM","Random Forest","XGB","Cubist"), .before = 1)
+
+#knitr::kable(metrics_tbl, digits = 3)
+metrics_tbl
+```
+```{r performance plot}
+performance_plot_tbl <- metrics_tbl %>%
+  pivot_longer(cols = c(RMSE, Rsq, MAE), names_to = "Metric", values_to = "Value")
+
+# Plot
+ggplot(performance_plot_tbl, aes(x = Model, y = Value, fill = Metric)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Model Performance Metrics on Held-Out Test Data",
+    subtitle = "Comparison of RMSE, R², and MAE for 5 Regression Models",
+    y = "Metric Value",
+    x = "Model"
+  ) +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set1")
+```
+
+------------------------------------------------------------------------
+
+## 11· Variable Importance
+
+```{r varimp, fig.height=5, fig.width=6}
+cubist_imp <- varImp(cubist_fit)$importance %>%
+  tibble::rownames_to_column("Feature") %>%
+  arrange(desc(Overall)) %>%
+  slice_head(n = 20)
+
+ggplot(cubist_imp, aes(reorder(Feature, Overall), Overall)) +
+  geom_col(fill = "steelblue") + coord_flip() +
+  labs(title = "Cubist – Top 20", x = NULL, y = "Importance")
+```
+
+------------------------------------------------------------------------
+
+## 12· Deployment on *StudentEvaluation* File
+
+`PH` in the evaluation file is entirely `NA`, so we **exclude it before
+imputation** to avoid VIM’s sub‑script error. We then ensure that the dummy
+columns match the training matrix—adding any missing columns as zeroes in
+the correct order.
+
+```{r deploy}
+# 12a· kNN‑impute predictors (drop PH first)
+eval_knn <- eval_raw %>%
+  select(-PH) %>%            # remove all‑NA response
+  kNN(k = 5) %>%
+  select(-matches("(_imp$|_NAflag$)"))   
+
+# 12b· dummy‑encode Brand_Code
+eval_dummy <- dummy_cols(eval_knn, select_columns = "Brand_Code") %>%
+  select(-Brand_Code)
+
+# 12c· Align columns with training design matrix
+missing_cols <- setdiff(names(x_train), names(eval_dummy))
+if (length(missing_cols) > 0) {
+  eval_dummy[missing_cols] <- 0
+}
+# reorder to match training column order
+eval_dummy <- eval_dummy[, names(x_train)]
+
+# 12d· Predict pH using Random Forest
+pred_eval <- predict(cubist_fit, eval_dummy)
+
+# 12e· Save predictions
+write_xlsx(bind_cols(eval_raw, Predicted_PH = pred_eval), "ph_predictions.xlsx")
+```
+
+------------------------------------------------------------------------
+
+## 13· Conclusion
+
+To conclude, The ABC Beverage dataset's exploratory study demonstrates a complex relationship between process variables and pH results, a crucial quality indicator in the beverage production industry. While the majority of variables exhibit minimal missingness and stable distributions, a few features—such as Temperature, MNR, Oxygen Filler, Filler Speed—show substantial skewness and outliers. This suggests that these features might be candidates for process improvement or sensor re calibration.
+
+Both correlation coefficients and scatter plots support stronger linear relationships between pH and Bowl Setpoint, Filler Level, and Pressure Vacuum versus other predictors. On the other hand, factors like air pressure and filler speed have little predictive value, which might make it possible to simplify the model without noticeably sacrificing accuracy.
+
+It's interesting to note that Brand Code's categorical imbalance, in which Brand B predominates the data set, raises questions regarding possible modeling bias. Testing if pH behaves differently between brands is essential, particularly when applying the model to diverse production lines. To prevent skewed performance, brand-stratified sample or brand interactions should be introduced in future modeling efforts.
+
+Among the models we tested, Cubist gave the best fit—lowest RMSE and highest R²—by capturing nonlinear effects in features more effectively than linear or tree‐based methods. To improve on this, we could:
+- Tune Cubist’s main settings (number of committees, neighbors and rule pruning levels).
+- Check residuals for any consistent errors and use partial‐dependence plots to see how each predictor really effects pH.
+- Apply simple transformations (log or Box–Cox) to the most skewed inputs.
+- Add key interaction terms (for example, Temperature × Filler Speed).
+- Try fitting Cubist separately for each brand to guard against bias and improve overall accuracy.
+
+***
+
